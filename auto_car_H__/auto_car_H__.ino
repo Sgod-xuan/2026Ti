@@ -78,10 +78,15 @@ const uint8_t R_AIN2 = 5;
 #define DIST_AB      100.0f           // A→B 直线距离 cm
 #define DIST_CD      100.0f           // C→D 直线距离 cm
 #define DIST_DIAG    156.2f           // A→C 对角线距离 cm（sqrt(100²+120²)）
+#define DIST_ARC     125.7f           // 半圆弧长度 cm（pi * 40cm）
+
+#define STRAIGHT_ENDPOINT_RATIO 0.65f // 直线段至少完成65%后才响应黑线，避免起点误触发
+#define ARC_EXIT_BLACK_MAX      2     // 黑线传感器少于等于2个时，认为已离开当前顶点
 
 #define TARGET_AB    ((long)(DIST_AB   * ENCODER_PULSES_PER_CM))
 #define TARGET_CD    ((long)(DIST_CD   * ENCODER_PULSES_PER_CM))
 #define TARGET_DIAG  ((long)(DIST_DIAG * ENCODER_PULSES_PER_CM))
+#define TARGET_ARC   ((long)(DIST_ARC  * ENCODER_PULSES_PER_CM))
 
 #define DIAG_TURN_ANGLE  39.8f        // A点出发前需顺时针转的角度（朝向C）
 
@@ -114,9 +119,10 @@ const int R_FWD_DEADZONE = 29;
 const int R_REV_DEADZONE = 23;
 
 /*----------------------------------------------------------
- * 转向参数（陀螺仪原地转向）
+ * 转向参数（陀螺仪前进式差速转向）
  *----------------------------------------------------------*/
 float TURN_SPEED   = 7.0f;
+float TURN_INNER_SPEED = 0.0f; // 前进式转向内侧轮速度，避免倒车
 float ANGLE_KP     = 0.15f;
 float ANGLE_THRESH = 1.0f;    // 误差容限（度）
 
@@ -134,7 +140,7 @@ enum CarState {
   // 声光提示（通用，完成后跳 nextState）
   ST_BEEP,
 
-  // 陀螺仪原地转向（通用，完成后跳 nextState）
+  // 陀螺仪前进式差速转向（通用，完成后跳 nextState）
   ST_TURN_GYRO,
 
   // 直行（走空白路面，完成后触发 BEEP 再跳 nextState）
@@ -187,8 +193,14 @@ unsigned long lastGyroTime = 0;
 
 // 直行
 volatile long straightPulseL = 0;  // 正向脉冲累计
+volatile long segmentPulseL = 0;   // 当前段左轮正向脉冲累计
+volatile long segmentPulseR = 0;   // 当前段右轮正向脉冲累计
 long          straightTarget  = 0;
+long          straightLineDetectMin = 0;
 float         straightHeading = 0;
+long          arcTarget = TARGET_ARC;
+bool          straightHasLeftStartLine = false;
+bool          arcHasLeftStartPoint = false;
 
 // 声光提示
 unsigned long beepStart = 0;
@@ -241,6 +253,72 @@ void addTurn(float angle) {
   segTotal++;
 }
 
+void resetMotorPid()
+{
+  noInterrupts();
+  L_PWM = 0; L_Bias = 0; L_LastBias = 0;
+  R_PWM = 0; R_Bias = 0; R_LastBias = 0;
+  CountL = 0; CountR = 0;
+  interrupts();
+}
+
+int blackSensorCount()
+{
+  int count = 0;
+  if (s1) count++;
+  if (s2) count++;
+  if (s3) count++;
+  if (s4) count++;
+  return count;
+}
+
+long readStraightPulse()
+{
+  noInterrupts();
+  long value = straightPulseL;
+  interrupts();
+  return value;
+}
+
+long readSegmentPulse()
+{
+  noInterrupts();
+  long left = segmentPulseL;
+  long right = segmentPulseR;
+  interrupts();
+
+  if (left > 0 && right > 0) {
+    return (left + right) / 2;
+  }
+  return left > right ? left : right;
+}
+
+void setForwardTargets(float left, float right, float maxSpeed)
+{
+  TargetL = constrain(left, 0.0f, maxSpeed);
+  TargetR = constrain(right, 0.0f, maxSpeed);
+}
+
+void finishPointAndAdvance()
+{
+  TargetL = TargetR = 0;
+  resetMotorPid();
+  beepStart = 0;
+  nextState = (CarState)255;
+  carState  = ST_BEEP;
+}
+
+void beepOnceBlocking()
+{
+  TargetL = TargetR = 0;
+  resetMotorPid();
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, HIGH);
+  delay(BEEP_MS);
+  digitalWrite(BUZZER_PIN, HIGH);
+  digitalWrite(LED_PIN, LOW);
+}
+
 // 开始执行某一段
 void startSegment(int idx);
 
@@ -260,6 +338,8 @@ void advanceToNext() {
       return;
     }
 #endif
+    TargetL = TargetR = 0;
+    resetMotorPid();
     carState = ST_STOP;
   } else {
     startSegment(segIdx);
@@ -377,22 +457,35 @@ void startSegment(int idx)
   {
     case SEG_STRAIGHT:
       // 重置直行计数
+      resetMotorPid();
       noInterrupts();
       straightPulseL = 0;
+      segmentPulseL = 0;
+      segmentPulseR = 0;
       interrupts();
       straightTarget  = seg.param_l;
+      straightLineDetectMin = (long)(straightTarget * STRAIGHT_ENDPOINT_RATIO);
       straightHeading = currentAngle;
+      straightHasLeftStartLine = false;
       carState = ST_STRAIGHT;
       break;
 
     case SEG_ARC:
+      resetMotorPid();
+      noInterrupts();
+      segmentPulseL = 0;
+      segmentPulseR = 0;
+      interrupts();
       lastError = 0;
+      arcTarget = TARGET_ARC;
+      arcHasLeftStartPoint = false;
       carState  = ST_ARC;
       TargetL   = BASE_SPEED;
       TargetR   = BASE_SPEED;
       break;
 
     case SEG_TURN:
+      resetMotorPid();
       turnStartAngle  = currentAngle;
       targetTurnAngle = seg.param_f;
       carState = ST_TURN_GYRO;
@@ -414,6 +507,7 @@ void loop()
 
   bool allBlack = (s1 && s2 && s3 && s4);
   bool hasLine  = (s1 || s2 || s3 || s4);
+  int blackCount = blackSensorCount();
 
   /* ---- ST_WAIT ---- */
   if (carState == ST_WAIT)
@@ -426,6 +520,8 @@ void loop()
       lapCount = 0;
       finalBeepDone = false;
       segIdx = 0;
+      Serial.println("启动声光提示");
+      beepOnceBlocking();
       Serial.println("出发！");
       startSegment(0);
     }
@@ -460,7 +556,7 @@ void loop()
     return;
   }
 
-  /* ---- ST_TURN_GYRO：原地转向到目标角度 ---- */
+  /* ---- ST_TURN_GYRO：前进式差速转向到目标角度 ---- */
   if (carState == ST_TURN_GYRO)
   {
     float turned = currentAngle - turnStartAngle;
@@ -471,6 +567,7 @@ void loop()
     if (reached)
     {
       TargetL = TargetR = 0;
+      resetMotorPid();
       Serial.println("转向完成");
       delay(150);
       // 转向完成后直接前进到下一段（不需要声光提示）
@@ -482,9 +579,9 @@ void loop()
       float speed = constrain(remaining * ANGLE_KP, 2.0f, TURN_SPEED);
 
       if (targetTurnAngle > 0) {
-        TargetL = -speed; TargetR = +speed;  // 左转
+        TargetL = TURN_INNER_SPEED; TargetR = speed;  // 前进式左转
       } else {
-        TargetL = +speed; TargetR = -speed;  // 右转
+        TargetL = speed; TargetR = TURN_INNER_SPEED;  // 前进式右转
       }
     }
     delay(5);
@@ -494,39 +591,38 @@ void loop()
   /* ---- ST_STRAIGHT：走空白路面 ---- */
   if (carState == ST_STRAIGHT)
   {
-    // 优先检测：若传感器发现弧线，说明到达终点附近，提前切换
-    if (hasLine)
+    long straightPulse = readStraightPulse();
+
+    if (!hasLine) {
+      straightHasLeftStartLine = true;
+    }
+
+    bool canDetectEndLine = straightHasLeftStartLine &&
+                            straightPulse >= straightLineDetectMin;
+
+    // 直线段只在离开起点且接近终点后响应黑线，避免 A/C/B 点起步误判。
+    if (hasLine && canDetectEndLine)
     {
-      Serial.println("直行检测到弧线，切换巡线");
-      // 直接声光提示，然后跳下一段（弧线段）
-      nextState = ST_BEEP;  // 将在BEEP里跳 advanceToNext()
-      // 实际上我们需要BEEP完后进入下一段，用特殊处理
-      beepStart = 0;
-      nextState = (CarState)255;  // 哨兵，BEEP完成后调用 advanceToNext
-      carState  = ST_BEEP;
-      TargetL   = TargetR = 0;
+      Serial.println("直行到达目标弧线/顶点");
+      finishPointAndAdvance();
       delay(5);
       return;
     }
 
     // 到达目标脉冲
-    if (straightPulseL >= (unsigned long)straightTarget)
+    if (straightPulse >= straightTarget)
     {
-      TargetL = TargetR = 0;
       Serial.print("直行完成，脉冲=");
-      Serial.println(straightPulseL);
+      Serial.println(straightPulse);
       delay(100);
-      beepStart = 0;
-      nextState = (CarState)255;  // 哨兵
-      carState  = ST_BEEP;
+      finishPointAndAdvance();
       return;
     }
 
     // 陀螺仪航向保持
     float headingErr = currentAngle - straightHeading;
     float corr = headingErr * STRAIGHT_KP * STRAIGHT_SPEED;
-    TargetL = STRAIGHT_SPEED - corr;
-    TargetR = STRAIGHT_SPEED + corr;
+    setForwardTargets(STRAIGHT_SPEED - corr, STRAIGHT_SPEED + corr, STRAIGHT_SPEED * 1.6f);
 
     delay(5);
     return;
@@ -535,15 +631,25 @@ void loop()
   /* ---- ST_ARC：弧线巡线 ---- */
   if (carState == ST_ARC)
   {
-    // 全黑：到达顶点
-    if (allBlack)
+    long segmentPulse = readSegmentPulse();
+
+    if (!arcHasLeftStartPoint)
     {
-      TargetL = TargetR = 0;
-      Serial.println("到达顶点（全黑）");
+      if (blackCount <= ARC_EXIT_BLACK_MAX) {
+        arcHasLeftStartPoint = true;
+        Serial.println("已离开当前顶点，开始寻找下一顶点");
+      }
+    }
+
+    bool arcDistanceReached = segmentPulse >= arcTarget;
+
+    // 场地没有额外顶点标记，弧线段以半圆弧长计距为主；全黑仅作为兼容兜底。
+    if (arcDistanceReached || (arcHasLeftStartPoint && allBlack))
+    {
+      Serial.print("弧线段完成，脉冲=");
+      Serial.println(segmentPulse);
       delay(150);
-      beepStart = 0;
-      nextState = (CarState)255;  // 哨兵
-      carState  = ST_BEEP;
+      finishPointAndAdvance();
       return;
     }
 
@@ -551,8 +657,7 @@ void loop()
     if (!hasLine)
     {
       float corr = LINE_KP * lastError;
-      TargetL = BASE_SPEED * 0.6f + corr;
-      TargetR = BASE_SPEED * 0.6f - corr;
+      setForwardTargets(BASE_SPEED * 0.6f + corr, BASE_SPEED * 0.6f - corr, BASE_SPEED);
       delay(5);
       return;
     }
@@ -562,8 +667,7 @@ void loop()
     float correction = LINE_KP * error + LINE_KD * (error - lastError);
     lastError = error;
 
-    TargetL = constrain(BASE_SPEED + correction, -BASE_SPEED * 2, BASE_SPEED * 2);
-    TargetR = constrain(BASE_SPEED - correction, -BASE_SPEED * 2, BASE_SPEED * 2);
+    setForwardTargets(BASE_SPEED + correction, BASE_SPEED - correction, BASE_SPEED * 2);
 
     delay(5);
     return;
@@ -615,15 +719,24 @@ void READ_ENCODER_L()
     delta = (digitalRead(L_ENCODER_B) == LOW) ?  1 : -1;
 
   CountL += delta;
-  if (delta > 0) straightPulseL += delta;  // 仅正向计距
+  if (delta > 0) {
+    straightPulseL += delta;  // 仅正向计距
+    segmentPulseL += delta;
+  }
 }
 
 void READ_ENCODER_R()
 {
+  int delta;
   if (digitalRead(R_ENCODER_A) == LOW)
-    CountR += (digitalRead(R_ENCODER_B) == LOW) ?  1 : -1;
+    delta = (digitalRead(R_ENCODER_B) == LOW) ?  1 : -1;
   else
-    CountR += (digitalRead(R_ENCODER_B) == LOW) ? -1 :  1;
+    delta = (digitalRead(R_ENCODER_B) == LOW) ? -1 :  1;
+
+  CountR += delta;
+  if (delta > 0) {
+    segmentPulseR += delta;
+  }
 }
 
 /*==========================================================
@@ -636,6 +749,10 @@ void motorControl()
 
   valueL = Incremental_PI(VelocityL, TargetL, L_KP, L_KI, L_PWM, L_Bias, L_LastBias);
   valueR = Incremental_PI(VelocityR, TargetR, R_KP, R_KI, R_PWM, R_Bias, R_LastBias);
+
+  // H 题要求行驶时只能前进，负 PWM 只会造成主动后退，统一钳为 0。
+  if (valueL < 0) valueL = 0;
+  if (valueR < 0) valueR = 0;
 
   Set_PWM_L(valueL);
   Set_PWM_R(valueR);
