@@ -29,7 +29,8 @@ Encoder:
 
 Control and IMU:
 
-- Start button -> D4, `INPUT_PULLUP`, pressed is LOW.
+- Reference start button -> D4, `INPUT_PULLUP`, pressed is LOW.
+- C07A current start button -> onboard SW1 / PB8, pressed is LOW.
 - MPU6050 SDA -> A4.
 - MPU6050 SCL -> A5.
 - MPU6050 address -> `0x68`.
@@ -45,7 +46,7 @@ Optional hardware kept for debugging only:
 Implement these weak functions for the real board:
 
 - `platform_hw_init()`: configure clock, GPIO, PWM timers, encoder interrupts, I2C, LED, and buzzer.
-- `platform_hw_start_button_pressed()`: return true when D4 logical button is pressed.
+- `platform_hw_start_button_pressed()`: return true when the configured start button is pressed; the current C07A mapping uses onboard SW1 / PB8.
 - `platform_hw_line_pin_is_high(index)`: return raw LF04 digital level; the platform layer maps LOW to black.
 - `platform_hw_take_left_encoder_ticks()` and `platform_hw_take_right_encoder_ticks()`: atomically return and clear encoder counts accumulated during the last 10 ms control period.
 - `platform_hw_set_left_pwm()` and `platform_hw_set_right_pwm()`: accept signed PWM after PI and dead-zone compensation.

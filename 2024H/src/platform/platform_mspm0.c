@@ -3,6 +3,7 @@
 #include <stddef.h>
 
 #include "control/motor_pi.h"
+#include "platform/c07a_pinmap.h"
 #include "platform/platform_hw.h"
 
 #define SYST_CSR (*(volatile uint32_t *)0xE000E010u)
@@ -220,9 +221,19 @@ WEAK void platform_hw_init(void)
 {
 }
 
+WEAK bool platform_hw_c07a_sw1_pin_is_high(void)
+{
+    return true;
+}
+
 WEAK bool platform_hw_start_button_pressed(void)
 {
-    return false;
+    const bool sw1_is_high = platform_hw_c07a_sw1_pin_is_high();
+#if C07A_START_BUTTON_ACTIVE_LOW
+    return !sw1_is_high;
+#else
+    return sw1_is_high;
+#endif
 }
 
 WEAK uint8_t platform_hw_route_switch_value(void)

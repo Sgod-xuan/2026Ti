@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 void platform_hw_init(void);
+bool platform_hw_c07a_sw1_pin_is_high(void);
 bool platform_hw_start_button_pressed(void);
 uint8_t platform_hw_route_switch_value(void);
 bool platform_hw_line_pin_is_high(uint8_t index);
